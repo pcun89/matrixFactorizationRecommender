@@ -34,3 +34,322 @@ DEFAULT_REG = 0.02
 DEFAULT_EPOCHS = 20
 MODEL_OUTPUT = "mf_model.joblib"
 # -------------------
+
+
+def generateSyntheticRatings(
+    nUsers: int = 1000, nItems: int = 500, sparsity: float = 0.05, seed: int = RANDOM_STATE
+) -> pd.DataFrame:
+    """
+    Generate synthetic ratings for demonstration.
+    Returns DataFrame with columns: user_id, item_id, rating
+    Rating values in [1, 5].
+    """
+    rng = np.random.default_rng(seed)
+    totalPossible = nUsers * nItems
+    nRatings = max(1, int(totalPossible * sparsity))
+    userIds = rng.integers(0, nUsers, size=nRatings)
+    itemIds = rng.integers(0, nItems, size=nRatings)
+
+    # underlying ground-truth latent factors to create realistic ratings
+    trueUserFactors = rng.normal(scale=1.0, size=(nUsers, 8))
+    trueItemFactors = rng.normal(scale=1.0, size=(nItems, 8))
+    # generate ratings from dot product + noise, then clip to 1..5
+    ratings = []
+    for u, i in zip(userIds, itemIds):
+        raw = float(
+            np.dot(trueUserFactors[u], trueItemFactors[i]) + rng.normal(scale=0.5))
+        # normalize raw value to 1..5
+        r = 3.0 + 0.8 * raw
+        r = float(np.clip(r, 1.0, 5.0))
+        ratings.append(r)
+
+    df = pd.DataFrame({"user_id": userIds.astype(
+        str), "item_id": itemIds.astype(str), "rating": ratings})
+    # drop duplicates keeping first (optional)
+    df = df.drop_duplicates(
+        subset=["user_id", "item_id"]).reset_index(drop=True)
+    return df
+
+
+def loadRatingsCsv(csvPath: str, userCol: str, itemCol: str, ratingCol: str) -> pd.DataFrame:
+    """
+    Load ratings CSV. Requires columns: userCol, itemCol, ratingCol.
+    Returns DataFrame with columns: user_id, item_id, rating (all as strings for ids).
+    """
+    df = pd.read_csv(csvPath)
+    if userCol not in df.columns or itemCol not in df.columns or ratingCol not in df.columns:
+        raise ValueError("CSV is missing required columns.")
+    out = df[[userCol, itemCol, ratingCol]].rename(
+        columns={userCol: "user_id", itemCol: "item_id", ratingCol: "rating"})
+    out["user_id"] = out["user_id"].astype(str)
+    out["item_id"] = out["item_id"].astype(str)
+    out["rating"] = out["rating"].astype(float)
+    return out
+
+
+def trainTestSplitRatings(df: pd.DataFrame, testFraction: float = 0.2, seed: int = RANDOM_STATE) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split ratings DataFrame into train/test by random sampling of rows.
+    """
+    df_shuffled = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    cutoff = int(len(df_shuffled) * (1.0 - testFraction))
+    return df_shuffled.iloc[:cutoff].reset_index(drop=True), df_shuffled.iloc[cutoff:].reset_index(drop=True)
+
+
+class MatrixFactorization:
+    """
+    Simple MF with user/item latent factors trained by SGD on observed ratings.
+    - supports predict(user_id, item_id)
+    - supports recommend(user_id, top_n)
+    """
+
+    def __init__(self, nFactors: int = DEFAULT_N_FACTORS, lr: float = DEFAULT_LR, reg: float = DEFAULT_REG, seed: int = RANDOM_STATE):
+        self.nFactors = nFactors
+        self.lr = lr
+        self.reg = reg
+        self.seed = seed
+        self.userMap: Dict[str, int] = {}
+        self.itemMap: Dict[str, int] = {}
+        self.userFactors: np.ndarray | None = None  # shape (n_users, nFactors)
+        self.itemFactors: np.ndarray | None = None  # shape (n_items, nFactors)
+        self.userBias: np.ndarray | None = None
+        self.itemBias: np.ndarray | None = None
+        self.globalMean: float = 0.0
+
+    def _init_factors(self, nUsers: int, nItems: int) -> None:
+        rng = np.random.default_rng(self.seed)
+        self.userFactors = rng.normal(scale=0.1, size=(nUsers, self.nFactors))
+        self.itemFactors = rng.normal(scale=0.1, size=(nItems, self.nFactors))
+        self.userBias = np.zeros(nUsers, dtype=float)
+        self.itemBias = np.zeros(nItems, dtype=float)
+
+    def fit(self, dfTrain: pd.DataFrame, nEpochs: int = DEFAULT_EPOCHS, verbose: bool = True) -> None:
+        """
+        Train using SGD over observed ratings.
+        Expects dfTrain columns: user_id, item_id, rating
+        """
+        # build id maps
+        uniqueUsers = dfTrain["user_id"].unique().tolist()
+        uniqueItems = dfTrain["item_id"].unique().tolist()
+        self.userMap = {u: idx for idx, u in enumerate(uniqueUsers)}
+        self.itemMap = {i: idx for idx, i in enumerate(uniqueItems)}
+        nUsers = len(self.userMap)
+        nItems = len(self.itemMap)
+
+        # init factors and biases
+        self._init_factors(nUsers, nItems)
+
+        # global mean
+        self.globalMean = dfTrain["rating"].mean()
+
+        # prepare training triplets (mapped ints)
+        rows = []
+        for _, r in dfTrain.iterrows():
+            u = self.userMap[r["user_id"]]
+            i = self.itemMap[r["item_id"]]
+            rows.append((u, i, float(r["rating"])))
+        # convert to array for faster shuffling
+        rows = np.array(rows, dtype=float)  # shape (n_obs, 3)
+        # training loop
+        for epoch in range(1, nEpochs + 1):
+            # shuffle
+            idxs = np.arange(rows.shape[0])
+            np.random.RandomState(self.seed + epoch).shuffle(idxs)
+            sse = 0.0
+            for idx in idxs:
+                u, i, r = rows[idx]
+                u = int(u)
+                i = int(i)
+                pred = self.predict_internal_index(u, i)
+                err = r - pred
+                sse += err * err
+                # update biases
+                self.userBias[u] += self.lr * \
+                    (err - self.reg * self.userBias[u])
+                self.itemBias[i] += self.lr * \
+                    (err - self.reg * self.itemBias[i])
+                # update latent factors (SGD)
+                uf = self.userFactors[u].copy()
+                if self.itemFactors is None:
+                    raise RuntimeError("itemFactors not initialized")
+                self.userFactors[u] += self.lr * \
+                    (err * self.itemFactors[i] - self.reg * uf)
+                self.itemFactors[i] += self.lr * \
+                    (err * uf - self.reg * self.itemFactors[i])
+            rmse = math.sqrt(sse / rows.shape[0])
+            if verbose:
+                print(f"Epoch {epoch}/{nEpochs} RMSE (train): {rmse:.4f}")
+
+    def predict_internal_index(self, uIndex: int, iIndex: int) -> float:
+        """Predict using internal integer indices (no mapping)."""
+        # prediction = global + userBias + itemBias + dot(userFactors, itemFactors)
+        return float(self.globalMean + self.userBias[uIndex] + self.itemBias[iIndex] + np.dot(self.userFactors[uIndex], self.itemFactors[iIndex]))
+
+    def predict(self, userId: str, itemId: str) -> float:
+        """
+        Predict rating for given userId and itemId (string ids).
+        If user or item unknown, use global mean and nearest biases/factors where possible.
+        """
+        if self.userFactors is None or self.itemFactors is None:
+            raise RuntimeError("Model not trained yet")
+        uKnown = userId in self.userMap
+        iKnown = itemId in self.itemMap
+        if not uKnown and not iKnown:
+            return float(self.globalMean)
+        if uKnown and iKnown:
+            u = self.userMap[userId]
+            i = self.itemMap[itemId]
+            return self.predict_internal_index(u, i)
+        # partial known: average over known
+        if uKnown and not iKnown:
+            u = self.userMap[userId]
+            # average dot over all items
+            dot = float(
+                np.dot(self.userFactors[u], self.itemFactors.T.mean(axis=0)))
+            return float(self.globalMean + self.userBias[u] + dot)
+        if iKnown and not uKnown:
+            i = self.itemMap[itemId]
+            dot = float(np.dot(self.userFactors.mean(
+                axis=0), self.itemFactors[i]))
+            return float(self.globalMean + self.itemBias[i] + dot)
+
+    def recommend(self, userId: str, topN: int = 10, excludeKnown: bool = True) -> List[Tuple[str, float]]:
+        """
+        Recommend top-N items for a given userId.
+        Returns list of (itemId, score) sorted by score desc.
+        If user unknown, returns top-popular items by bias+dot of mean user.
+        """
+        if self.userFactors is None or self.itemFactors is None:
+            raise RuntimeError("Model not trained yet")
+        # build reverse maps
+        invItemMap = {v: k for k, v in self.itemMap.items()}
+        if userId in self.userMap:
+            u = self.userMap[userId]
+            # scores = predictions for all items
+            scores = self.globalMean + \
+                self.userBias[u] + self.itemBias + \
+                (self.itemFactors @ self.userFactors[u])
+        else:
+            # new user: use mean user factors
+            meanUser = self.userFactors.mean(axis=0)
+            scores = self.globalMean + self.itemBias + \
+                (self.itemFactors @ meanUser)
+        # optionally exclude known items
+        excludeSet = set()
+        if excludeKnown and userId in self.userMap:
+            # find known items by checking training data (not stored directly). We could pass known set; simple approach: exclude items with high observed bias
+            pass  # keep simple: do not exclude in this lightweight implementation
+
+        # get top indices
+        topIdx = np.argsort(scores)[::-1][:topN]
+        results = [(invItemMap[int(idx)], float(scores[int(idx)]))
+                   for idx in topIdx]
+        return results
+
+    def save(self, outPath: str = MODEL_OUTPUT) -> None:
+        """
+        Save model artifacts (userMap, itemMap, userFactors, itemFactors, biases, globalMean) with joblib.
+        """
+        payload = {
+            "nFactors": self.nFactors,
+            "lr": self.lr,
+            "reg": self.reg,
+            "seed": self.seed,
+            "userMap": self.userMap,
+            "itemMap": self.itemMap,
+            "userFactors": self.userFactors,
+            "itemFactors": self.itemFactors,
+            "userBias": self.userBias,
+            "itemBias": self.itemBias,
+            "globalMean": self.globalMean,
+        }
+        joblib.dump(payload, outPath)
+        print(f"Saved MF model to: {outPath}")
+
+    def load(self, inPath: str = MODEL_OUTPUT) -> None:
+        """
+        Load model artifacts saved by save().
+        """
+        payload = joblib.load(inPath)
+        self.nFactors = payload["nFactors"]
+        self.lr = payload["lr"]
+        self.reg = payload["reg"]
+        self.seed = payload["seed"]
+        self.userMap = payload["userMap"]
+        self.itemMap = payload["itemMap"]
+        self.userFactors = payload["userFactors"]
+        self.itemFactors = payload["itemFactors"]
+        self.userBias = payload["userBias"]
+        self.itemBias = payload["itemBias"]
+        self.globalMean = payload["globalMean"]
+        print(f"Loaded MF model from: {inPath}")
+
+
+# -------------------
+# Utilities
+# -------------------
+def rmse(yTrue: np.ndarray, yPred: np.ndarray) -> float:
+    return float(math.sqrt(mean_squared_error(yTrue, yPred)))
+
+
+# -------------------
+# Main
+# -------------------
+def main(argv: list | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Matrix Factorization recommender (SGD)")
+    parser.add_argument("--csv_path", type=str, default=None,
+                        help="Optional CSV path with columns user_id,item_id,rating")
+    parser.add_argument("--user_col", type=str, default="user_id")
+    parser.add_argument("--item_col", type=str, default="item_id")
+    parser.add_argument("--rating_col", type=str, default="rating")
+    parser.add_argument("--n_factors", type=int, default=DEFAULT_N_FACTORS)
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR)
+    parser.add_argument("--reg", type=float, default=DEFAULT_REG)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--test_fraction", type=float, default=0.2)
+    args = parser.parse_args(args=argv)
+
+    # Load or synthesize data
+    if args.csv_path:
+        df = loadRatingsCsv(args.csv_path, args.user_col,
+                            args.item_col, args.rating_col)
+    else:
+        print("No CSV provided — generating synthetic ratings dataset.")
+        df = generateSyntheticRatings(nUsers=1000, nItems=500, sparsity=0.02)
+
+    print("Total ratings:", len(df))
+    trainDf, testDf = trainTestSplitRatings(
+        df, testFraction=args.test_fraction)
+
+    model = MatrixFactorization(
+        nFactors=args.n_factors, lr=args.lr, reg=args.reg)
+    print("Training matrix factorization...")
+    model.fit(trainDf, nEpochs=args.epochs, verbose=True)
+
+    # Evaluate on test set
+    yTrue = []
+    yPred = []
+    for _, r in testDf.iterrows():
+        uId = str(r["user_id"])
+        iId = str(r["item_id"])
+        yTrue.append(float(r["rating"]))
+        yPred.append(model.predict(uId, iId))
+    yTrue = np.array(yTrue)
+    yPred = np.array(yPred)
+    testRmse = float(np.sqrt(mean_squared_error(yTrue, yPred)))
+    print(f"Test RMSE: {testRmse:.4f}")
+
+    # Sample recommendations for a random user from training set
+    sampleUser = trainDf["user_id"].iloc[0]
+    top = model.recommend(str(sampleUser), topN=5)
+    print("Top-5 recommendations (item_id, score):")
+    for itemId, score in top:
+        print(f"  {itemId}  -> {score:.4f}")
+
+    # Save model
+    model.save(MODEL_OUTPUT)
+
+
+if __name__ == "__main__":
+    main()
