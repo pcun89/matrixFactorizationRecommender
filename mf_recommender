@@ -1,0 +1,15 @@
+"""
+mf_recommender.py
+
+Matrix Factorization recommender (explicit ratings) using SGD.
+
+Style:
+- camelCase variable and function names
+- docstrings for functions
+- main() entrypoint
+- inline comments explaining steps
+
+Usage:
+    python mf_recommender.py
+    python mf_recommender.py --csv_path ratings.csv --user_col uid --item_col iid --rating_col rating
+"""
