@@ -1,4 +1,4 @@
-# matriMatrix Factorization Recommender (SGD)
+# Matrix Factorization Recommender (SGD)
 
 **Project:** Collaborative filtering using matrix factorization (user/item embeddings) trained with SGD for explicit ratings.
 
