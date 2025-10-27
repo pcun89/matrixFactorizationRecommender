@@ -24,3 +24,13 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_squared_error
 import joblib
+# -------------------
+# Defaults / config
+# -------------------
+RANDOM_STATE = 42
+DEFAULT_N_FACTORS = 32
+DEFAULT_LR = 0.01
+DEFAULT_REG = 0.02
+DEFAULT_EPOCHS = 20
+MODEL_OUTPUT = "mf_model.joblib"
+# -------------------
