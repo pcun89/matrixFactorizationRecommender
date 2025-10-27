@@ -1,0 +1,81 @@
+# tests/test_mf_recommender.py
+"""
+Smoke tests for mf_recommender.py
+
+Fast tests:
+- small synthetic dataset (nUsers=50, nItems=30, sparsity=0.05)
+- short training (nEpochs=2)
+- small nFactors (8)
+"""
+import os
+import tempfile
+import numpy as np
+import joblib
+import pytest
+
+import mf_recommender as mfr
+
+
+@pytest.fixture
+def small_ratings_df():
+    # tiny synthetic dataset for speed
+    df = mfr.generateSyntheticRatings(nUsers=50, nItems=30, sparsity=0.05, seed=123)
+    assert not df.empty
+    return df
+
+
+def test_generate_synthetic_ratings_shape():
+    df = mfr.generateSyntheticRatings(nUsers=20, nItems=10, sparsity=0.1, seed=1)
+    assert set(["user_id", "item_id", "rating"]).issubset(df.columns)
+    # ratings within [1,5]
+    assert df["rating"].min() >= 1.0 and df["rating"].max() <= 5.0
+
+
+def test_train_fit_predict_small(small_ratings_df):
+    trainDf, testDf = mfr.trainTestSplitRatings(small_ratings_df, testFraction=0.2, seed=1)
+    model = mfr.MatrixFactorization(nFactors=8, lr=0.02, reg=0.01, seed=42)
+    # train for 2 epochs only (fast)
+    model.fit(trainDf, nEpochs=2, verbose=False)
+
+    # pick an observed example from test (should be present)
+    sample = testDf.iloc[0]
+    pred = model.predict(str(sample["user_id"]), str(sample["item_id"]))
+    assert isinstance(pred, float)
+    # prediction should be finite and in reasonable numeric range
+    assert np.isfinite(pred)
+    assert pred > -1e3 and pred < 1e4
+
+
+def test_recommend_returns_items(small_ratings_df):
+    trainDf, testDf = mfr.trainTestSplitRatings(small_ratings_df, testFraction=0.2, seed=2)
+    model = mfr.MatrixFactorization(nFactors=8, lr=0.02, reg=0.01, seed=7)
+    model.fit(trainDf, nEpochs=2, verbose=False)
+
+    sampleUser = trainDf["user_id"].iloc[0]
+    recs = model.recommend(str(sampleUser), topN=5)
+    assert isinstance(recs, list)
+    assert len(recs) <= 5
+    # each recommendation is (itemId, score)
+    for itemId, score in recs:
+        assert isinstance(itemId, str)
+        assert isinstance(score, float)
+        assert np.isfinite(score)
+
+
+def test_save_and_load_model(tmp_path, small_ratings_df):
+    trainDf, testDf = mfr.trainTestSplitRatings(small_ratings_df, testFraction=0.2, seed=3)
+    model = mfr.MatrixFactorization(nFactors=6, lr=0.01, reg=0.02, seed=0)
+    model.fit(trainDf, nEpochs=2, verbose=False)
+
+    outPath = tmp_path / "mf_model_test.joblib"
+    model.save(str(outPath))
+    assert outPath.exists()
+
+    # load into a new instance
+    loaded = mfr.MatrixFactorization()
+    loaded.load(str(outPath))
+    # sanity check: predict for a known pair from trainDf
+    u = str(trainDf.iloc[0]["user_id"])
+    i = str(trainDf.iloc[0]["item_id"])
+    p = loaded.predict(u, i)
+    assert np.isfinite(p)
